@@ -6,7 +6,9 @@ import process from 'node:process';
 // Constants
 // ============================================================================
 
-const GEMINI_API_URL = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent';
+// GLM 4.7 via z.ai (智譜 AI)
+const GLM_API_BASE = 'https://api.z.ai/api/coding/paas/v4';
+const GLM_DEFAULT_MODEL = 'glm-4.7';
 const OPENAI_DEFAULT_API_BASE = 'https://api.openai.com/v1';
 const OPENAI_DEFAULT_MODEL = 'gpt-4o-mini';
 const FEED_FETCH_TIMEOUT_MS = 15_000;
@@ -366,32 +368,44 @@ async function fetchAllFeeds(feeds: typeof RSS_FEEDS): Promise<Article[]> {
 // AI Providers (Gemini + OpenAI-compatible fallback)
 // ============================================================================
 
-async function callGemini(prompt: string, apiKey: string): Promise<string> {
-  const response = await fetch(`${GEMINI_API_URL}?key=${apiKey}`, {
+async function callGLM(prompt: string, apiKey: string, apiBase: string, model: string): Promise<string> {
+  const normalizedBase = apiBase.replace(/\/+$/, '');
+  const response = await fetch(`${normalizedBase}/chat/completions`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${apiKey}`,
+    },
     body: JSON.stringify({
-      contents: [{ parts: [{ text: prompt }] }],
-      generationConfig: {
-        temperature: 0.3,
-        topP: 0.8,
-        topK: 40,
-      },
+      model,
+      messages: [{ role: 'user', content: prompt }],
+      temperature: 0.3,
+      top_p: 0.8,
     }),
   });
-  
+
   if (!response.ok) {
     const errorText = await response.text().catch(() => 'Unknown error');
-    throw new Error(`Gemini API error (${response.status}): ${errorText}`);
+    throw new Error(`Kimi API error (${response.status}): ${errorText}`);
   }
-  
+
   const data = await response.json() as {
-    candidates?: Array<{
-      content?: { parts?: Array<{ text?: string }> };
+    choices?: Array<{
+      message?: {
+        content?: string | Array<{ type?: string; text?: string }>;
+      };
     }>;
   };
-  
-  return data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+
+  const content = data.choices?.[0]?.message?.content;
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    return content
+      .filter(item => item.type === 'text' && typeof item.text === 'string')
+      .map(item => item.text)
+      .join('\n');
+  }
+  return '';
 }
 
 async function callOpenAICompatible(
@@ -446,48 +460,24 @@ function inferOpenAIModel(apiBase: string): string {
 }
 
 function createAIClient(config: {
-  geminiApiKey?: string;
-  openaiApiKey?: string;
-  openaiApiBase?: string;
-  openaiModel?: string;
+  glmApiKey?: string;
+  glmApiBase?: string;
+  glmModel?: string;
 }): AIClient {
   const state = {
-    geminiApiKey: config.geminiApiKey?.trim() || '',
-    openaiApiKey: config.openaiApiKey?.trim() || '',
-    openaiApiBase: (config.openaiApiBase?.trim() || OPENAI_DEFAULT_API_BASE).replace(/\/+$/, ''),
-    openaiModel: config.openaiModel?.trim() || '',
-    geminiEnabled: Boolean(config.geminiApiKey?.trim()),
-    fallbackLogged: false,
+    glmApiKey: config.glmApiKey?.trim() || '',
+    glmApiBase: (config.glmApiBase?.trim() || GLM_API_BASE).replace(/\/+$/, ''),
+    glmModel: config.glmModel?.trim() || GLM_DEFAULT_MODEL,
+    glmEnabled: Boolean(config.glmApiKey?.trim()),
   };
-
-  if (!state.openaiModel) {
-    state.openaiModel = inferOpenAIModel(state.openaiApiBase);
-  }
 
   return {
     async call(prompt: string): Promise<string> {
-      if (state.geminiEnabled && state.geminiApiKey) {
-        try {
-          return await callGemini(prompt, state.geminiApiKey);
-        } catch (error) {
-          if (state.openaiApiKey) {
-            if (!state.fallbackLogged) {
-              const reason = error instanceof Error ? error.message : String(error);
-              console.warn(`[digest] Gemini failed, switching to OpenAI-compatible fallback (${state.openaiApiBase}, model=${state.openaiModel}). Reason: ${reason}`);
-              state.fallbackLogged = true;
-            }
-            state.geminiEnabled = false;
-            return callOpenAICompatible(prompt, state.openaiApiKey, state.openaiApiBase, state.openaiModel);
-          }
-          throw error;
-        }
+      if (state.glmEnabled && state.glmApiKey) {
+        return await callGLM(prompt, state.glmApiKey, state.glmApiBase, state.glmModel);
       }
 
-      if (state.openaiApiKey) {
-        return callOpenAICompatible(prompt, state.openaiApiKey, state.openaiApiBase, state.openaiModel);
-      }
-
-      throw new Error('No AI API key configured. Set GEMINI_API_KEY and/or OPENAI_API_KEY.');
+      throw new Error('No AI API key configured. Set ZAI_API_KEY.');
     },
   };
 }
@@ -1012,10 +1002,9 @@ Options:
   --help          Show this help
 
 Environment:
-  GEMINI_API_KEY   Optional but recommended. Get one at https://aistudio.google.com/apikey
-  OPENAI_API_KEY   Optional fallback key for OpenAI-compatible APIs
-  OPENAI_API_BASE  Optional fallback base URL (default: https://api.openai.com/v1)
-  OPENAI_MODEL     Optional fallback model (default: deepseek-chat for DeepSeek base, else gpt-4o-mini)
+  BAILIAN_API_KEY   Required. Get one at https://bailian.console.aliyun.com/
+  KIMI_API_BASE     Optional. Base URL for Kimi API (default: https://dashscope.aliyuncs.com/compatible-mode/v1)
+  KIMI_MODEL        Optional. Model name (default: kimi-k2.5)
 
 Examples:
   bun scripts/digest.ts --hours 24 --top-n 10 --lang zh
@@ -1046,22 +1035,20 @@ async function main(): Promise<void> {
     }
   }
   
-  const geminiApiKey = process.env.GEMINI_API_KEY;
-  const openaiApiKey = process.env.OPENAI_API_KEY;
-  const openaiApiBase = process.env.OPENAI_API_BASE;
-  const openaiModel = process.env.OPENAI_MODEL;
+  const glmApiKey = process.env.ZAI_API_KEY;
+  const glmApiBase = process.env.GLM_API_BASE;
+  const glmModel = process.env.GLM_MODEL;
 
-  if (!geminiApiKey && !openaiApiKey) {
-    console.error('[digest] Error: Missing API key. Set GEMINI_API_KEY and/or OPENAI_API_KEY.');
-    console.error('[digest] Gemini key: https://aistudio.google.com/apikey');
+  if (!glmApiKey) {
+    console.error('[digest] Error: Missing API key. Set ZAI_API_KEY.');
+    console.error('[digest] Get one at: https://open.bigmodel.cn/');
     process.exit(1);
   }
 
   const aiClient = createAIClient({
-    geminiApiKey,
-    openaiApiKey,
-    openaiApiBase,
-    openaiModel,
+    glmApiKey,
+    glmApiBase,
+    glmModel,
   });
   
   if (!outputPath) {
@@ -1069,17 +1056,12 @@ async function main(): Promise<void> {
     outputPath = `./digest-${dateStr}.md`;
   }
   
-  console.log(`[digest] === AI Daily Digest ===`);
+  console.log(`[digest] === AI Daily Digest (GLM 4.7) ===`);
   console.log(`[digest] Time range: ${hours} hours`);
   console.log(`[digest] Top N: ${topN}`);
   console.log(`[digest] Language: ${lang}`);
   console.log(`[digest] Output: ${outputPath}`);
-  console.log(`[digest] AI provider: ${geminiApiKey ? 'Gemini (primary)' : 'OpenAI-compatible (primary)'}`);
-  if (openaiApiKey) {
-    const resolvedBase = (openaiApiBase?.trim() || OPENAI_DEFAULT_API_BASE).replace(/\/+$/, '');
-    const resolvedModel = openaiModel?.trim() || inferOpenAIModel(resolvedBase);
-    console.log(`[digest] Fallback: ${resolvedBase} (model=${resolvedModel})`);
-  }
+  console.log(`[digest] AI provider: GLM 4.7 via z.ai`);
   console.log('');
   
   console.log(`[digest] Step 1/5: Fetching ${RSS_FEEDS.length} RSS feeds...`);
